@@ -227,8 +227,12 @@ services:
         - debug
     environment:
         <<: *airflow-common-env
+    env_file:
+      - .env
+    volumes:
+      - .:/opt/project
     user: "50000:0"
-    entrypoint: [ "/bin/bash", "-c" ]
+    entrypoint: [ "/bin/bash", "-c" , "sleep 3600"]
 
 volumes:
   postgres-db-volume:
