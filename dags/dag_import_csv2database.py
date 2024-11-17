@@ -1,19 +1,26 @@
+import logging
+
 from airflow import DAG
 from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 from airflow.decorators import task
 from airflow.utils.dates import days_ago
 import pandas as pd
 import os
+import sqlalchemy as sa
+from sqlalchemy import text
 
 MSSQL_CONN_ID = 'mssql_conn_id'
 CSV_PATH = '/opt/airflow/files/plandaten.csv'  # Adjust path as needed
-SCHEMA_NAME = 'iw20s82105'  # Update with your schema name
-TABLE_NAME = 'Plandaten_ETL_test'  # Update with your table name
+DATABASE_NAME = 'iw20s82105'
+TABLE_NAME = 'Plandaten_ETL'
 
 default_args = {
     'owner': 'airflow',
     'start_date': days_ago(1)
 }
+
+logger = logging.getLogger(__name__)
+logger.info("This is a log message")
 
 with DAG(
         dag_id='plandaten_etl_pipeline',
@@ -21,7 +28,7 @@ with DAG(
         schedule_interval='@daily',
         catchup=False
 ) as dag:
-
+    #
     @task()
     def extract_plandaten_data():
         """Extract data from CSV file."""
@@ -30,11 +37,13 @@ with DAG(
             df = pd.read_csv(
                 CSV_PATH,
                 sep=';',
-                encoding='utf-8'
+                encoding='utf-8',
+                nrows=100
             )
             return df.to_dict('records')
         except Exception as e:
             raise Exception(f"Failed to read CSV file: {str(e)}")
+
 
     @task()
     def transform_plandaten_data(raw_data):
@@ -54,6 +63,7 @@ with DAG(
         except Exception as e:
             raise Exception(f"Failed to transform data: {str(e)}")
 
+
     @task()
     def load_plandaten_data(transformed_data):
         """Load transformed data into MSSQL."""
@@ -61,27 +71,34 @@ with DAG(
 
         # Create table if it doesn't exist
         create_table_sql = f"""
-        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[{SCHEMA_NAME}].[{TABLE_NAME}]') AND type in (N'U'))
-        BEGIN
-            CREATE TABLE [{SCHEMA_NAME}].[{TABLE_NAME}] (
-                [Mon_ID] VARCHAR(6),
-                [Land_ID] VARCHAR(2),
-                [Produkt_ID] VARCHAR(4),
-                [Umsatzplan] DECIMAL(10,2),
-                [load_timestamp] DATETIME DEFAULT GETDATE()
-            )
-        END
-        """
+        if not exists (select * from sys.objects where name='{TABLE_NAME}' and type = 'U')
+        CREATE TABLE {TABLE_NAME} (
+            Mon_ID varchar(6) COLLATE Latin1_General_CI_AS NOT NULL,
+            Land_ID varchar(2) COLLATE Latin1_General_CI_AS NOT NULL,
+            Produkt_ID varchar(4) COLLATE Latin1_General_CI_AS NOT NULL,
+            Umsatzplan money NULL,
+            CONSTRAINT PK_{TABLE_NAME} PRIMARY KEY (Mon_ID, Land_ID, Produkt_ID)
+        );"""
 
         try:
             # Create table
-            mssql_hook.run(create_table_sql)
+            conn = mssql_hook.get_conn()
+            cursor = conn.cursor()
 
+            cursor.execute(create_table_sql)
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            raise Exception(f"Failed to create table: {str(e)}")
+
+        try:
             # Insert data
             insert_sql = f"""
-            INSERT INTO [{SCHEMA_NAME}].[{TABLE_NAME}] 
+            INSERT INTO {TABLE_NAME}
             ([Mon_ID], [Land_ID], [Produkt_ID], [Umsatzplan])
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
             """
 
             # Prepare batch of records
@@ -90,16 +107,19 @@ with DAG(
                 for row in transformed_data
             ]
 
-            # Execute batch insert
             conn = mssql_hook.get_conn()
             cursor = conn.cursor()
+            # cursor.fast_executemany = True # new in pyodbc 4.0.19 (https://stackoverflow.com/questions/29638136/how-to-speed-up-bulk-insert-to-ms-sql-server-using-pyodbc)
+
             cursor.executemany(insert_sql, records)
+
             conn.commit()
             cursor.close()
             conn.close()
 
         except Exception as e:
             raise Exception(f"Failed to load data into MSSQL: {str(e)}")
+
 
     # Define the DAG workflow
     extracted_data = extract_plandaten_data()
