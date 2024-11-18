@@ -12,3 +12,12 @@ docker compose up airflow-init
 ```bash
 docker compose up
 ```
+
+## Debugging / Testing DAG locally
+```bash
+docker compose up airflow-python
+```
+
+Pycharm -> Interpreter Settings -> Add Interpreter -> Docker Compose -> service=aiflow-python
+
+Run Configuration -> Commands and Options -> `exec`
