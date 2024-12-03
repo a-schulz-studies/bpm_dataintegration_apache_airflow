@@ -9,19 +9,23 @@ from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 from airflow.decorators import task
 from airflow.utils.dates import days_ago
 
+# Constants
 MSSQL_CONN_ID = 'mssql_conn_id'
 CSV_INPUT_PATH = '/opt/airflow/files/'
 CSV_ARCHIVE_PATH = '/opt/airflow/files/archived/'
 TABLE_NAME = 'Umsatzdaten_ETL'
 
+# Default arguments
 default_args = {
     'owner': 'airflow',
     'start_date': days_ago(1)
 }
 
+# Logger configuration
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info("This is a log message")
 
+# DAG Definition
 with DAG(
         dag_id='umsatzdaten_etl_pipeline',
         default_args=default_args,
@@ -32,7 +36,11 @@ with DAG(
     @task()
     def check_for_files():
         """Check for files in the input directory."""
-        files = [f for f in os.listdir(CSV_INPUT_PATH) if (f.startswith('Belege') and f.endswith('.csv'))]
+        if not os.path.exists(CSV_INPUT_PATH):
+            logger.info(f"Input directory does not exist: {CSV_INPUT_PATH}")
+            return []
+
+        files = [f for f in os.listdir(CSV_INPUT_PATH) if f.startswith('Belege') and f.endswith('.csv')]
         if not files:
             logger.info("No files found. Pipeline will terminate successfully.")
             return []
@@ -44,12 +52,7 @@ with DAG(
         """Extract data from a CSV file."""
         try:
             file_path = os.path.join(CSV_INPUT_PATH, filename)
-            df = pd.read_csv(
-                file_path,
-                sep=',',
-                encoding='utf-8',
-                dtype=str
-            )
+            df = pd.read_csv(file_path, sep=',', encoding='utf-8', dtype=str)
             df['Preis'] = df['Preis'].astype(float)
             df['Anzahl'] = df['Anzahl'].astype(int)
             return df.to_dict('records')
@@ -61,19 +64,18 @@ with DAG(
         produktsubkategorie_lookup = {}
         produkt_lookup = {}
         mssql_hook = MsSqlHook(mssql_conn_id=MSSQL_CONN_ID)
-        conn = mssql_hook.get_conn()
 
-        with conn.cursor() as cursor:
-            # Fetch produktsubkategorie_lookup
-            cursor.execute("SELECT Subkategorie_ID, Mitarbeiter_ID FROM Produktsubkategorie;")
-            for subkategorie_id, mitarbeiter_id in cursor.fetchall():
-                produktsubkategorie_lookup[subkategorie_id] = mitarbeiter_id
+        with mssql_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                # Fetch produktsubkategorie_lookup
+                cursor.execute("SELECT Subkategorie_ID, Mitarbeiter_ID FROM Produktsubkategorie;")
+                for subkategorie_id, mitarbeiter_id in cursor.fetchall():
+                    produktsubkategorie_lookup[subkategorie_id] = mitarbeiter_id
 
-            # Fetch produkt_lookup
-            cursor.execute("SELECT Produkt_ID, Subkategorie_ID FROM Produkt;")
-            for produkt_id, subkategorie_id in cursor.fetchall():
-                produkt_lookup[produkt_id] = subkategorie_id
-        conn.close()
+                # Fetch produkt_lookup
+                cursor.execute("SELECT Produkt_ID, Subkategorie_ID FROM Produkt;")
+                for produkt_id, subkategorie_id in cursor.fetchall():
+                    produkt_lookup[produkt_id] = subkategorie_id
         return produktsubkategorie_lookup, produkt_lookup
 
     @task()
@@ -116,55 +118,62 @@ with DAG(
     def load_data(transformed_data):
         """Load transformed data into MSSQL."""
         mssql_hook = MsSqlHook(mssql_conn_id=MSSQL_CONN_ID)
+
         create_table_sql = f"""
-        IF NOT EXISTS (SELECT * FROM sys.objects WHERE name='{TABLE_NAME}' AND type = 'U')
-        CREATE TABLE {TABLE_NAME} (
-            Mon_ID         VARCHAR(6),
-            Land_ID        VARCHAR(2),
-            Produkt_ID     VARCHAR(4),
-            Mitarbeiter_ID VARCHAR(2),
-            Umsatzbetrag   MONEY,
-            Umsatzmenge    INTEGER
-        );
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE name='{TABLE_NAME}' AND type='U')
+        
+            CREATE TABLE {TABLE_NAME} (
+                Mon_ID         VARCHAR(6),
+                Land_ID        VARCHAR(2),
+                Produkt_ID     VARCHAR(4),
+                Mitarbeiter_ID VARCHAR(2),
+                Umsatzbetrag   MONEY,
+                Umsatzmenge    INTEGER
+            );
+        
         """
-        insert_sql = f"""
-            INSERT INTO {TABLE_NAME}
+
+        insert_sql = f"""INSERT INTO {TABLE_NAME}
             ([Mon_ID], [Land_ID], [Produkt_ID], [Mitarbeiter_ID], [Umsatzbetrag], [Umsatzmenge])
             VALUES (%s, %s, %s, %s, %s, %s)
             """
+
         try:
-            conn = mssql_hook.get_conn()
-            cursor = conn.cursor()
-            cursor.execute(create_table_sql)
-            cursor.executemany(insert_sql, [
-                (row['Mon_ID'], row['Land_ID'], row['Produkt_ID'], row['Mitarbeiter_ID'],
-                 row['Umsatzbetrag'], row['Umsatzmenge']) for row in transformed_data
-            ])
-            conn.commit()
+            with mssql_hook.get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(create_table_sql)
+                    cursor.executemany(insert_sql, [
+                        (row['Mon_ID'], row['Land_ID'], row['Produkt_ID'], row['Mitarbeiter_ID'],
+                         row['Umsatzbetrag'], row['Umsatzmenge']) for row in transformed_data
+                    ])
+                conn.commit()
         except Exception as e:
             raise Exception(f"Failed to load data: {str(e)}")
-        finally:
-            cursor.close()
-            conn.close()
 
     @task()
     def archive_file(filename):
         """Move the processed file to the archive directory."""
         try:
+            if not os.path.exists(CSV_ARCHIVE_PATH):
+                os.makedirs(CSV_ARCHIVE_PATH)
+
             source_path = os.path.join(CSV_INPUT_PATH, filename)
             dest_path = os.path.join(CSV_ARCHIVE_PATH, filename)
-            shutil.move(source_path, dest_path)
-            logger.info(f"Archived file: {filename}")
+
+            if os.path.exists(source_path):
+                shutil.move(source_path, dest_path)
+                logger.info(f"Archived file: {filename}")
+            else:
+                logger.warning(f"File not found for archiving: {filename}")
         except Exception as e:
             raise Exception(f"Failed to archive file {filename}: {str(e)}")
 
     # Define the DAG workflow
     files = check_for_files()
-    for file in files:
-        raw_data = extract_data(file)
-        transformed_data = transform_data(raw_data)
-        load_data(transformed_data)
-        archive_file(file)
+    raw_data = extract_data.expand(filename=files)
+    transformed_data = transform_data.expand(raw_data=raw_data)
+    load_data_task = load_data.expand(transformed_data=transformed_data)
+    archive_file.expand(filename=files) << load_data_task
 
 if __name__ == "__main__":
     dag.test()
